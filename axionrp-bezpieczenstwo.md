@@ -3,7 +3,8 @@
 > Dokument roboczy dla lokalnej sesji. Zawiera wyniki przeglądu bezpieczeństwa
 > strony **axionrp.com** oraz konkretne kroki do wdrożenia.
 > Stack: **ASP.NET Core** za reverse-proxy **nginx**. Logowanie przez **Steam OpenID**.
-> Data przeglądu: 2026-07-19. Zakres: przegląd pasywny + lekkie testy aktywne (nieniszczące).
+> Data przeglądu: 2026-07-19 (I) + 2026-07-20 (ponowny, po wdrożeniu poprawek).
+> Zakres: przegląd pasywny + lekkie testy aktywne (nieniszczące).
 
 ---
 
@@ -21,6 +22,35 @@
 - `/api/me` bez logowania zwraca tylko `{"loggedIn":false}` — brak wycieku danych.
 - Ciasteczka `axion_auth`: `Secure; HttpOnly; SameSite=Lax` — wzorcowo.
 - Panel `/admin/` chroniony (HTTP Basic Auth, realm "AxionRP Admin").
+
+---
+
+## 🔁 Aktualizacja po ponownym przeglądzie (2026-07-20)
+
+**Potwierdzone naprawy (weszły):**
+- CSP `script-src` używa `'nonce-...'`, a nonce **rotuje per-request** (zweryfikowane).
+- `community.json` / `status.json` → 200 (backend działa), zwracają tylko publiczne statystyki.
+- `security.txt`, `robots.txt`, `sitemap.xml` → 200.
+- Zapis przez API bez logowania zablokowany: `POST/PUT` → 405, `DELETE` → 404.
+- Wrażliwe pliki nadal 404; `/.well-known/` → 403 (brak listowania).
+- `/login?r=...` — `return_to` trzyma się domeny `axionrp.com` niezależnie od `r`.
+
+**Drobne, wciąż do dopięcia (nic krytycznego):**
+1. `/api/me` bez `Cache-Control: no-store` — dane zalogowanego usera mogą być
+   buforowane. Dodać na endpointach z danymi konta:
+   `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache`.
+2. `robots.txt` wypisuje `/admin/`, `/api/`, `/panel` — publicznie zdradza mapę
+   wrażliwych ścieżek. Usunąć `/admin/` z listy (jest za Basic Auth); dla `/panel`
+   użyć nagłówka `X-Robots-Tag: noindex` zamiast wpisu w robots.
+3. CSP `style-src` nadal ma `'unsafe-inline'` (skrypty już naprawione) — docelowo
+   nonce/hash też dla stylów. Ryzyko niskie.
+4. `security.txt` ujawnia prywatny Gmail — rozważyć adres roli (`security@axionrp.com`).
+
+**Do potwierdzenia po stronie serwera (nieweryfikowalne z zewnątrz):**
+- Open-redirect `r=`: potwierdzić w kodzie `Url.IsLocalUrl(returnUrl)` (wartość `r`
+  jedzie w zaszyfrowanym `state`, więc finalny redirect po loginie widać tylko w kodzie).
+- Rate-limiting `/admin/`: potwierdzić, że `limit_req` w nginx jest aktywny
+  (celowo nie testowane atakiem).
 
 ---
 
@@ -130,6 +160,75 @@ Preferred-Languages: pl, en
 - [ ] Centralne logi dostępu + alerty o anomaliach (masa 401/403/404).
 - [ ] Monitoring uptime.
 - [ ] (Opcjonalnie) monitoring integralności plików.
+
+---
+
+## 🌊 Ochrona przed DDoS i architektura (strona + serwer gry na jednym VPS)
+
+**Problem:** strona WWW i serwer Unturned stoją na **jednym VPS z jednym publicznym IP**.
+
+Ryzyka:
+- **Współdzielone zasoby** — DDoS w którekolwiek z nich zapycha całą maszynę
+  (łącze/CPU/RAM). Pada jedno → pada wszystko.
+- **Wyciek IP** — każdy gracz łączący się z serwerem gry **zna IP**. Skoro strona
+  jest na tym samym IP, atakujący automatycznie zna też IP strony.
+- **Cloudflare nie pomoże**, dopóki to samo IP jest publiczne przez serwer gry —
+  atakujący pomija proxy i wali prosto w origin.
+  Wniosek: **na współdzielonym IP nie da się skutecznie ukryć origin strony.**
+
+### Rekomendowana kolejność działań
+
+**Poziom 1 — tanie/darmowe (od razu):**
+- Strona za **Cloudflare** (darmowy plan, ochrona L7) — pod warunkiem, że origin IP
+  jest inny niż to znane z gry (patrz Poziom 2).
+- **Firewall:** otwarte tylko potrzebne porty (443 WWW + port gry + SSH), reszta DROP.
+- **Rate-limiting nginx + fail2ban** — pomaga na słabsze ataki L7. NIE zatrzyma
+  dużego ataku wolumetrycznego L3/L4.
+
+**Poziom 2 — właściwe rozwiązanie (rekomendowane):**
+- **Rozdzielić na dwa IP / dwie maszyny:** strona na jednym VPS (za Cloudflare),
+  serwer gry na drugim. Atak na gadżet nie kładzie strony, a IP strony pozostaje ukryte.
+- **Serwer gry u dostawcy z ochroną anty-DDoS L3/L4** (np. OVH Game/VAC lub usługa
+  scrubbing/filtrująca). To najważniejsze — gry są celem ataków wolumetrycznych,
+  których zwykły VPS nie wytrzyma.
+
+**Poziom 3 — dla spokoju:**
+- **Tunel GRE / reverse-proxy przez scrubbing provider** dla ruchu gry, żeby prawdziwe
+  IP serwera nigdy nie było widoczne graczom.
+
+### Do rozmowy z hostingodawcą (filtry firewall)
+Zapytać, czy oferują / mogą włączyć:
+- **Ochronę wolumetryczną L3/L4 na łączu** (scrubbing) — kluczowe, software tego nie
+  zastąpi, bo łącze zapcha się zanim ruch dojdzie do filtrowania na VPS.
+- **Filtry/ACL na brzegu sieci** dla portu gry (limit pakietów/s, ochrona przed
+  amplifikacją UDP, blokada spoofowanych źródeł).
+- **Osobne IP** dla serwera gry i dla strony.
+
+Przykładowe filtry po stronie VPS (uzupełnienie, nie zamiennik ochrony na łączu):
+```bash
+# nftables — limit nowych połączeń TCP per IP (ochrona L7/SYN flood na WWW)
+nft add rule inet filter input tcp dport {80,443} ct state new \
+  meter conlimit { ip saddr limit rate 60/second burst 100 packets } accept
+
+# iptables — limit nowych połączeń na port gry (dostosuj port!)
+iptables -A INPUT -p udp --dport 27015 -m hashlimit \
+  --hashlimit-name gamelim --hashlimit-mode srcip \
+  --hashlimit-above 200/sec --hashlimit-burst 400 -j DROP
+
+# SYN flood — podstawowa ochrona
+iptables -A INPUT -p tcp --syn -m limit --limit 20/s --limit-burst 40 -j ACCEPT
+```
+```nginx
+# nginx — limit żądań i połączeń (ochrona L7)
+limit_req_zone  $binary_remote_addr zone=wwwlim:10m rate=20r/s;
+limit_conn_zone $binary_remote_addr zone=connlim:10m;
+server {
+    limit_req  zone=wwwlim burst=40 nodelay;
+    limit_conn connlim 20;
+}
+```
+> Uwaga: filtry na VPS łagodzą małe/średnie ataki i L7. Przy dużym wolumenie
+> (dziesiątki Gb/s) ratuje wyłącznie ochrona na łączu u dostawcy.
 
 ---
 
