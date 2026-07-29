@@ -3,7 +3,7 @@
 > Dokument roboczy dla lokalnej sesji. Zawiera wyniki przeglądu bezpieczeństwa
 > strony **axionrp.com** oraz konkretne kroki do wdrożenia.
 > Stack: **ASP.NET Core** za reverse-proxy **nginx**. Logowanie przez **Steam OpenID**.
-> Data przeglądu: 2026-07-19 (I) + 2026-07-20 (ponowny, po wdrożeniu poprawek).
+> Data przeglądu: 2026-07-19 (I) + 2026-07-20 (II) + 2026-07-29 (III).
 > Zakres: przegląd pasywny + lekkie testy aktywne (nieniszczące).
 
 ---
@@ -54,6 +54,64 @@
 
 ---
 
+## 🔁 Przegląd III (2026-07-29) — stan aktualny
+
+**Strona działa** — `/` → `200 OK`, backend statusowy odpowiada, brak błędów 5xx.
+
+### ✅ Naprawione od poprzedniego przeglądu
+| Pozycja | Stan |
+|---|---|
+| `/api/me` bez `Cache-Control` (drobiazg 1) | ✅ jest `no-store, no-cache, must-revalidate` + `Pragma: no-cache` |
+| `robots.txt` zdradzał `/admin/` i `/api/` (drobiazg 2) | ✅ oba wpisy usunięte (został `/panel`, `/panel/`, `/account`) |
+| SPF / DMARC (1.2) | ✅ `v=spf1 include:mx.ovh.com -all` oraz `v=DMARC1; p=quarantine; pct=100; sp=quarantine` |
+| `community.json` / `status.json` → 502 (2.2) | ✅ oba `200`, zwracają wyłącznie publiczne statystyki |
+| CSP nonce dla `script-src` | ✅ potwierdzone ponownie — nonce **rotuje per-request** (3/3 różne) |
+| `server_tokens` | ✅ `Server: nginx` bez wersji, także na stronie 404 |
+| Cache na stronie głównej | ✅ doszedł `Cache-Control: no-store` |
+
+Nadal trzyma się poprzedni stan: HSTS, `nosniff`, `X-Frame-Options`, `Referrer-Policy`,
+`Permissions-Policy`, HTTP→HTTPS 301, brak listowania katalogów, wrażliwe pliki 404
+(`.env`, `.git/config`, `config.php`, `backup.zip`, `web.config`, `appsettings*.json`,
+`server-status` — wszystkie 404), `/.well-known/` → 403, `/panel` → 302 na `/login`,
+`/admin/` → 401, `/api/me` bez sesji → `{"loggedIn":false}`.
+Metody zapisu zablokowane: `POST/PUT/DELETE/PATCH/OPTIONS/TRACE` na `/api/announcements` → **405**.
+Ciasteczko korelacyjne OpenID: `secure; samesite=lax; httponly`, `path=/signin-steam` — wzorcowo.
+
+### 🟠 Nadal otwarte
+1. **Rate-limiting `/admin/` prawdopodobnie NIE działa.** 12 szybkich żądań pod rząd →
+   12× `401`, ani jednego `503`/`429`. Przy `rate=5r/m burst=5` limit powinien się odezwać.
+   Wdrożyć `limit_req` z pkt 2.1 i zweryfikować, że blok `location /admin/` faktycznie go używa.
+2. **CSP `style-src` wciąż z `'unsafe-inline'`** (`script-src` już czysty). Ryzyko niskie,
+   ale to ostatnia dziura w CSP — docelowo nonce/hash także dla stylów.
+3. **`security.txt` ujawnia prywatnego Gmaila** (`wosmateusz611@gmail.com`). Ten sam adres
+   siedzi publicznie w `rua=` rekordu DMARC. Założyć `security@axionrp.com` i podmienić w obu miejscach.
+4. **Brak `Cross-Origin-Opener-Policy` / `Cross-Origin-Resource-Policy`** (pkt 2.3, nadal do dodania).
+5. **DMARC do zaostrzenia:** `p=quarantine` → docelowo `p=reject`, gdy potwierdzisz, że
+   legalna poczta przechodzi. Rozważyć `aspf=s` zamiast `aspf=r`. **DKIM niezweryfikowany**
+   (selektor nieznany z zewnątrz) — sprawdzić w panelu OVH, czy podpisywanie jest włączone.
+6. **HSTS bez `preload`** — jeśli chcesz wejść na listę preload, dodać dyrektywę i zgłosić domenę.
+
+### ⚪ Wciąż niemożliwe do potwierdzenia z zewnątrz
+- **Open-redirect `r=`** — sprawdzone 5 wariantów (`//evil`, `https://evil`, `/\evil`,
+  `%2F%2Fevil`, `/panel`). W każdym przypadku `openid.return_to` wskazuje na
+  `https://axionrp.com/signin-steam`, a wartość `r` jedzie w zaszyfrowanym `state`.
+  Z zewnątrz wygląda dobrze, ale **finalny redirect po powrocie ze Steam widać tylko w kodzie** —
+  nadal trzeba potwierdzić `Url.IsLocalUrl(returnUrl)` (pkt 1.1).
+- **Certyfikat TLS i otwarte porty** — środowisko przeglądu ma proxy terminujące TLS,
+  więc widziany certyfikat i wynik skanu portów są bezwartościowe (kontrola potwierdziła,
+  że proxy podmienia issuer i blokuje surowy TCP). Certyfikat sprawdzić z własnej maszyny
+  lub na SSL Labs; porty przez `nmap` spoza VPS-a.
+
+### ⚠️ Uwaga architektoniczna (bez zmian)
+`axionrp.com` i `www.axionrp.com` rozwiązują się na **81.210.88.68** — origin wystawiony
+bezpośrednio, bez CDN/Cloudflare przed nim. Cała sekcja "Ochrona przed DDoS" niżej pozostaje aktualna.
+
+### Drobiazg poza bezpieczeństwem
+`HEAD` na `/panel` i `/login` zwraca `405`. Nie jest to luka, ale monitoring uptime
+i część crawlerów używa `HEAD` — warto obsłużyć.
+
+---
+
 ## 🔴 PRIORYTET 1 — do zrobienia w pierwszej kolejności
 
 ### 1.1 Open-redirect w parametrze `r=` (logowanie)
@@ -71,9 +129,16 @@ return Redirect("/"); // fallback
 Reguła: akceptuj tylko wartości zaczynające się od pojedynczego `/`.
 Odrzucaj `//`, `http://`, `https://`, `\`, `%2F%2F` itp.
 
-### 1.2 Poczta — SPF / DMARC / DKIM (anti-spoofing)
-Nie udało się sprawdzić z zewnątrz — **zweryfikować na https://mxtoolbox.com**.
-Bez tych rekordów ktoś może podszyć się pod `@axionrp.com`.
+### 1.2 Poczta — SPF / DMARC / DKIM (anti-spoofing) — ✅ ZROBIONE (2026-07-29)
+Rekordy są na miejscu:
+```
+axionrp.com.        TXT  "v=spf1 include:mx.ovh.com -all"
+_dmarc.axionrp.com. TXT  "v=DMARC1; p=quarantine; pct=100; rua=...; sp=quarantine; aspf=r"
+```
+Zostaje tylko dostrojenie: `p=reject`, `aspf=s`, weryfikacja DKIM w panelu OVH
+oraz podmiana prywatnego Gmaila w `rua=` na adres roli.
+
+<details><summary>Oryginalna rekomendacja (archiwum)</summary>
 
 Minimalny zestaw rekordów DNS (TXT):
 ```
@@ -83,12 +148,14 @@ axionrp.com.        TXT  "v=spf1 -all"        # jeśli domena NIE wysyła maili
 _dmarc.axionrp.com. TXT  "v=DMARC1; p=reject; rua=mailto:admin@axionrp.com"
 ```
 Jeśli domena wysyła maile (np. z hostingu) — dodać serwery do SPF i skonfigurować DKIM.
+</details>
 
 ---
 
 ## 🟠 PRIORYTET 2 — utwardzanie
 
-### 2.1 Panel `/admin/` — rate-limiting + ograniczenie po IP
+### 2.1 Panel `/admin/` — rate-limiting + ograniczenie po IP — ⚠️ NADAL DO ZROBIENIA
+Test 2026-07-29: 12 żądań pod rząd → 12× `401`, zero `503`. Limit nie działa.
 Basic Auth nie ma blokady po nieudanych próbach. Dodać w nginx:
 ```nginx
 # w http { }
@@ -109,28 +176,28 @@ location /admin/ {
 Dodatkowo rozważyć **fail2ban** na logi nginx (401 na `/admin/`).
 Docelowo: właściwy panel z sesjami + **2FA** zamiast Basic Auth.
 
-### 2.2 `community.json` / `status.json` → 502 Bad Gateway
-Usługa statusu serwera (backend) jest niedostępna. `502` zdradza reverse-proxy.
-- Naprawić/uruchomić usługę w tle.
-- Ustawić własną, dyskretną stronę błędu:
+### 2.2 `community.json` / `status.json` → ✅ NAPRAWIONE (oba `200`)
+Backend statusowy działa. Zostaje opcjonalnie własna strona błędu na wypadek
+kolejnej awarii (`/error.html` obecnie zwraca 404, czyli nie jest skonfigurowana):
 ```nginx
 error_page 502 503 504 /error.html;
 location = /error.html { internal; root /var/www/errors; }
 ```
 
-### 2.3 Nagłówki bezpieczeństwa — dopięcie
-- **CSP:** usunąć `'unsafe-inline'` ze `script-src` i `style-src`.
+### 2.3 Nagłówki bezpieczeństwa — dopięcie (`script-src` ✅, `style-src` ⚠️)
+- **CSP:** ~~`script-src`~~ ✅ zrobione (nonce per-request). Zostaje `'unsafe-inline'` w `style-src`.
   Docelowo używać `nonce` generowanego per-request, np.:
   `Content-Security-Policy: script-src 'self' 'nonce-XYZ'`.
   Przenieść inline `<script>`/`<style>` do zewnętrznych plików.
 - Rozważyć `Cross-Origin-Opener-Policy: same-origin` oraz
   `Cross-Origin-Resource-Policy: same-origin`.
 
-### 2.4 `security.txt`
-Dodać `/.well-known/security.txt`:
+### 2.4 `security.txt` — ✅ istnieje (⚠️ do poprawki adres kontaktowy)
+Plik `/.well-known/security.txt` odpowiada `200`, `Expires` ustawione na 2027-07-19.
+Do zmiany: `Contact` wskazuje na prywatnego Gmaila. Docelowo:
 ```
-Contact: mailto:admin@axionrp.com
-Expires: 2027-01-01T00:00:00Z
+Contact: mailto:security@axionrp.com
+Expires: 2027-07-19T00:00:00Z
 Preferred-Languages: pl, en
 ```
 
@@ -248,11 +315,18 @@ przeglądarki każdego odwiedzającego). Można jedynie:
 - `/panel` → wymaga logowania (302 na `/login?r=/panel`)
 - `/api/me` → JSON, bez logowania `{"loggedIn":false}`
 - `/api/announcements` → JSON publiczny (ogłoszenia)
-- `/community.json`, `/status.json` → obecnie 502 (backend down)
+- `/community.json`, `/status.json` → 200 (backend działa)
+- `/signin-steam` → callback OpenID (ustawia ciasteczko korelacyjne)
 - `/admin/` → HTTP Basic Auth (401)
+- `/account` → wymieniony w `robots.txt`
+- `/robots.txt`, `/sitemap.xml`, `/.well-known/security.txt` → 200
 
-## Kolejność wdrożenia (sugerowana)
-1. 1.1 open-redirect `r=`  → 1.2 SPF/DMARC
-2. 2.1 rate-limit `/admin/`  → 2.2 naprawa 502
-3. 2.3 CSP nonce  → 2.4 security.txt
-4. Priorytet 3 (higiena) — sukcesywnie.
+## Kolejność wdrożenia — stan na 2026-07-29
+1. ⚠️ **2.1 rate-limit `/admin/`** — potwierdzone, że nie działa. Najpilniejsze.
+2. ⚠️ **1.1 open-redirect `r=`** — sprawdzić `Url.IsLocalUrl` w kodzie (z zewnątrz OK).
+3. 🟡 2.4 podmiana kontaktu w `security.txt` + `rua=` DMARC na adres roli.
+4. 🟡 2.3 `style-src` bez `'unsafe-inline'` + COOP/CORP.
+5. 🟡 DMARC `p=reject`, weryfikacja DKIM w OVH.
+6. ✅ 1.2 SPF/DMARC, 2.2 backend statusowy, CSP `script-src` — zrobione.
+7. Priorytet 3 (higiena) — sukcesywnie.
+8. 🌊 Sekcja DDoS — origin nadal wystawiony bezpośrednio, temat otwarty.
