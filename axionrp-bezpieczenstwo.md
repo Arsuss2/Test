@@ -3,7 +3,7 @@
 > Dokument roboczy dla lokalnej sesji. Zawiera wyniki przeglądu bezpieczeństwa
 > strony **axionrp.com** oraz konkretne kroki do wdrożenia.
 > Stack: **ASP.NET Core** za reverse-proxy **nginx**. Logowanie przez **Steam OpenID**.
-> Data przeglądu: 2026-07-19 (I) + 2026-07-20 (ponowny, po wdrożeniu poprawek).
+> Data przeglądu: 2026-07-19 (I) + 2026-07-20 (II) + 2026-09-12 (III, po rozbudowie strony).
 > Zakres: przegląd pasywny + lekkie testy aktywne (nieniszczące).
 
 ---
@@ -51,6 +51,130 @@
   jedzie w zaszyfrowanym `state`, więc finalny redirect po loginie widać tylko w kodzie).
 - Rate-limiting `/admin/`: potwierdzić, że `limit_req` w nginx jest aktywny
   (celowo nie testowane atakiem).
+
+---
+
+## 🔁 Aktualizacja po przeglądzie III (2026-09-12)
+
+Strona mocno urosła od poprzedniego przeglądu: doszły `/account`, `/sklep`,
+`/pojazdy`, `/rankings`, system podań i sklep za walutę **AC (Axion Credits)**.
+To realnie zwiększa powierzchnię ataku (operacje zmieniające stan i saldo).
+
+**Potwierdzone naprawy (weszły):**
+- `Cache-Control: no-store, no-cache, must-revalidate` + `Pragma: no-cache`
+  na `/api/me`, `/api/announcements`, `/api/applications/*`, `/api/shop/*`
+  oraz `Cache-Control: no-store` na stronie głównej. (pkt 1 z listy II — zrobione)
+- `robots.txt` nie zdradza już `/admin/` ani `/api/`. (pkt 2 — częściowo)
+- CSP `script-src 'nonce-...'` — nonce rotuje per-request (3 kolejne żądania = 3 różne nonce).
+- **SPF i DMARC istnieją** (pkt 1.2 — w dużej mierze zrobione):
+  `v=spf1 include:mx.ovh.com -all` oraz `v=DMARC1; p=quarantine; pct=100; ...`.
+- `community.json` / `status.json` → 200, backend działa. (pkt 2.2 — zrobione)
+- Limit rozmiaru żądania działa: 2 MB body → `413`.
+- Tylko JSON przyjmowany: `text/plain` i `application/x-www-form-urlencoded` → `415`
+  (to samo w sobie blokuje CSRF z prostego formularza HTML; w parze z `SameSite=Lax`
+  ryzyko CSRF jest niskie mimo braku tokenów anty-CSRF).
+- Brak nagłówków CORS (nie ma odbicia `Origin`), preflight `OPTIONS` → `405`.
+- Host header injection: żądanie z obcym `Host:` → `403`. Wejście po IP na HTTPS → odrzucone.
+- Nadal 404 na `.env`, `.git/config`, `config.php`, `backup.zip`, `appsettings.json`,
+  `web.config`, `swagger`, `elmah.axd`, `trace.axd`; katalogi → `403`; `server_tokens off`.
+- Autoryzacja na nowych endpointach trzyma: `/account` → 302 na `/login`,
+  `POST /api/shop/buy` i `POST /api/applications` → `401`,
+  `GET /api/applications/mine` bez sesji → `{"loggedIn":false}` (brak wycieku).
+
+### 🔴 Najważniejsze z tego przeglądu
+
+**A. Brak rate-limitingu — potwierdzone testem (pkt 2.1 NIE wdrożony)**
+- 12 kolejnych błędnych logowań Basic Auth na `/admin/` → 12× `401`, ani jednego `503`.
+  `limit_req` na `/admin/` **nie działa** (albo jest ustawiony tak luźno, że nie łapie).
+- 20 żądań pod rząd na `/api/me` → 20× `200`.
+- 15 nieudanych `POST /api/shop/buy` → 15× `401`, bez spowolnienia.
+
+Teraz waży to więcej niż w lipcu: sklep wydaje walutę, a podania można spamować.
+Wdrożyć `limit_req` z sekcji 2.1 **oraz** limity na `/api/` (osobna, luźniejsza strefa),
+plus fail2ban na powtarzające się `401` z `/admin/`.
+
+**B. Prywatny Gmail w dwóch publicznych miejscach**
+- `security.txt` → `Contact: mailto:wosmateusz611@gmail.com`
+- DMARC → `rua=mailto:wosmateusz611@gmail.com`
+Oba są publicznie czytelne i będą zbierane przez spam/scrapery. Założyć adres roli
+(`security@axionrp.com`, `dmarc@axionrp.com`) i podmienić w obu miejscach.
+
+**C. Poczta — dokończyć**
+- DMARC jest na `p=quarantine`; docelowo `p=reject` (po okresie obserwacji raportów).
+- `aspf=r` (relaxed) → rozważyć `aspf=s`.
+- **DKIM niepotwierdzony** — selektor `default._domainkey` nie istnieje. Sprawdzić
+  w panelu OVH, który selektor jest aktywny, i włączyć DKIM jeśli go nie ma.
+
+### 🟠 Drobne do dopięcia
+
+1. `robots.txt` nadal wypisuje `/panel` i `/account`, a nagłówka `X-Robots-Tag: noindex`
+   na tych ścieżkach **nie ma**. Lepiej: wyrzucić je z `robots.txt` i dodać nagłówek.
+2. CSP `style-src` wciąż z `'unsafe-inline'` (skrypty już na nonce). Ryzyko niskie.
+3. Brak `Cross-Origin-Opener-Policy: same-origin` i `Cross-Origin-Resource-Policy: same-origin`.
+4. Brak rekordu **CAA** — dodać `axionrp.com. CAA 0 issue "letsencrypt.org"`,
+   żeby nikt inny nie wystawił certyfikatu na domenę.
+5. HSTS bez `preload` — jeśli domena ma zostać na HTTPS na stałe, dodać `preload`
+   i zgłosić na hstspreload.org (uwaga: trudno odwrócić).
+6. Kolejność kontroli: nieuwierzytelnione żądanie dostaje `400` (zły JSON), `415`
+   (zły content-type) i `413` (za duże body) **zanim** dostanie `401`. Czyli autoryzacja
+   jest sprawdzana po sparsowaniu ciała. Nic groźnego, ale taniej i bezpieczniej
+   odrzucać brak sesji jako pierwsze (`[Authorize]` na kontrolerze / filtr przed bindingiem).
+7. `sitemap.xml` nie zawiera nowych podstron (kwestia SEO, nie bezpieczeństwa).
+
+### 🟡 Front-end — escaping (przegląd kodu JS)
+
+Dobrze: `esc()` (przez `textContent`) jest stosowane konsekwentnie do **wszystkich
+pól tekstowych** z API — tytuły i treści ogłoszeń, nicki, nazwy pakietów, opisy,
+nazwy frakcji, klasy pojazdów. Nie znalazłem miejsca, gdzie tekst z serwera trafia
+do `innerHTML` bez escapowania.
+
+Do utwardzenia (dziś bezpieczne, bo serwer zwraca tam liczby):
+- Pola liczbowe wstawiane są surowo: `e.rank`, `x.members`, `x.onDuty`,
+  `'<button data-buy="'+p.id+'">'`. Gdyby API kiedykolwiek zwróciło tam string,
+  robi się z tego XSS (a `data-buy` to dodatkowo wstrzyknięcie w atrybut).
+- `nf()` / `num()` to `(v||0).toLocaleString('pl-PL')` — dla stringa
+  `toLocaleString()` zwraca ten string bez zmian, więc **nie escapuje**.
+- Fix: albo `esc(...)` wszędzie, albo twarde rzutowanie `Number(v)||0` w `nf`/`num`
+  i `parseInt` przy `p.id`.
+
+### 🔵 Do sprawdzenia w kodzie (z zewnątrz się nie da)
+
+Nowe funkcje operują na pieniądzach i uprawnieniach, więc to jest teraz najważniejsza
+rzecz do przejrzenia po stronie serwera:
+
+- **Sklep `/api/shop/buy`:** cena i saldo muszą być liczone **wyłącznie na serwerze**
+  na podstawie `packageId` (klient wysyła tylko `packageId` — dobrze). Sprawdzić, czy
+  serwer nie ufa żadnemu polu ceny/salda z żądania.
+- **Podwójne wydanie (race condition):** dwa równoległe `POST /api/shop/buy` przy
+  saldzie na jeden pakiet. Potrzebna transakcja + blokada wiersza konta
+  (`UPDATE ... WHERE saldo >= cena` w jednej transakcji), nie „odczytaj i zapisz".
+- **IDOR na podaniach:** `/api/applications/mine` musi filtrować po ID z sesji, nigdy
+  po ID z żądania. Sprawdzić też, czy nie ma endpointu przyjmującego cudze `applicationId`.
+- **`isAdmin` z `/api/shop` i „widok admina" na `/pojazdy`:** ukrycie w UI nic nie daje —
+  każda akcja admina musi być autoryzowana po stronie serwera przy każdym żądaniu.
+- **Open-redirect `r=`** (pkt 1.1): nadal nie do zweryfikowania z zewnątrz — `r` jedzie
+  w zaszyfrowanym `state` OpenID, `return_to` zawsze wskazuje `axionrp.com/signin-steam`
+  niezależnie od tego, co wstawię w `r` (`//evil`, `https://evil`, `/\evil`, `%2f%2f`).
+  Potwierdzić `Url.IsLocalUrl(returnUrl)` w kodzie.
+- **Limity na podaniach:** ile podań na konto na dobę, limit długości opisu, walidacja
+  nazwy firmy/organizacji (i jej escapowanie przy wyświetlaniu innym graczom).
+
+### ⚪ Czego NIE dało się sprawdzić z tego środowiska
+
+- **TLS (wersje, szyfry, certyfikat)** — ruch z tej sesji idzie przez proxy, które
+  podstawia własny certyfikat, więc wynik dotyczy proxy, a nie serwera. Wyniku
+  „TLS 1.0/1.1 wyłączone" **nie traktować jako potwierdzonego** — przepuścić domenę
+  przez ssllabs.com/ssltest.
+- **Skan portów** — z kontenera odpowiadały tylko 80 i 443, reszta (22, 25, 3306,
+  5432, 6379, 27015…) timeout. To najpewniej ograniczenie wyjścia po naszej stronie,
+  więc **nie jest to dowód**, że firewall jest dobrze ustawiony. Sprawdzić lokalnie
+  (`ss -tulpn`, `ufw status`) albo skanem z innej maszyny.
+
+### 🌊 DDoS — bez zmian, problem nadal aktualny
+
+`axionrp.com` i `www` rozwiązują się **wprost na `81.210.88.68`** — Cloudflare ani
+żadne proxy nie jest włączone, origin IP jest publiczne. Cała sekcja „Ochrona przed
+DDoS i architektura" niżej obowiązuje w całości i nic z niej nie zostało wdrożone.
 
 ---
 
@@ -109,7 +233,7 @@ location /admin/ {
 Dodatkowo rozważyć **fail2ban** na logi nginx (401 na `/admin/`).
 Docelowo: właściwy panel z sesjami + **2FA** zamiast Basic Auth.
 
-### 2.2 `community.json` / `status.json` → 502 Bad Gateway
+### 2.2 `community.json` / `status.json` → 502 Bad Gateway ✅ NAPRAWIONE (2026-09-12: 200)
 Usługa statusu serwera (backend) jest niedostępna. `502` zdradza reverse-proxy.
 - Naprawić/uruchomić usługę w tle.
 - Ustawić własną, dyskretną stronę błędu:
@@ -241,18 +365,34 @@ przeglądarki każdego odwiedzającego). Można jedynie:
 
 ---
 
-## Endpointy wykryte podczas przeglądu (mapa aplikacji)
-- `/` (strona główna, statyczny HTML, 31 KB)
-- `/login` → OpenID Steam (302)
-- `/logout` → czyści `axion_auth` (302 na `/`)
-- `/panel` → wymaga logowania (302 na `/login?r=/panel`)
-- `/api/me` → JSON, bez logowania `{"loggedIn":false}`
-- `/api/announcements` → JSON publiczny (ogłoszenia)
-- `/community.json`, `/status.json` → obecnie 502 (backend down)
+## Endpointy wykryte podczas przeglądu (mapa aplikacji, stan 2026-09-12)
+
+Strony:
+- `/` (strona główna, 43 KB), `/regulamin.html` → 200
+- `/pojazdy`, `/rankings`, `/sklep` → 200 (publiczne)
+- `/panel` → 302 na `/login?r=/panel` (wymaga logowania)
+- `/account` → 302 na `/login?r=/account` (wymaga logowania)
+- `/login` → OpenID Steam (302), `/logout` → czyści `axion_auth` (302 na `/`)
 - `/admin/` → HTTP Basic Auth (401)
 
-## Kolejność wdrożenia (sugerowana)
-1. 1.1 open-redirect `r=`  → 1.2 SPF/DMARC
-2. 2.1 rate-limit `/admin/`  → 2.2 naprawa 502
-3. 2.3 CSP nonce  → 2.4 security.txt
-4. Priorytet 3 (higiena) — sukcesywnie.
+API:
+- `/api/me` → bez logowania `{"loggedIn":false}`
+- `/api/announcements` → GET publiczny; POST → 405
+- `/api/rankings`, `/api/pojazdy` → GET publiczny
+- `/api/shop` → GET, bez logowania `{"loggedIn":false,"isAdmin":false,...}` + cennik
+- `/api/shop/buy` → POST, bez sesji `401`
+- `/api/applications` → POST, bez sesji `401` (GET → 405)
+- `/api/applications/mine` → GET, bez sesji `{"loggedIn":false}`
+- `/community.json`, `/status.json` → 200 (tylko publiczne statystyki)
+
+## Kolejność wdrożenia — zaktualizowana 2026-09-12
+1. **Rate-limiting** `/admin/` + `/api/` i fail2ban (pkt A) — potwierdzone, że nie ma.
+2. **Przegląd kodu sklepu i podań**: transakcja przy zakupie (double-spend),
+   IDOR na podaniach, autoryzacja akcji admina po stronie serwera.
+3. **Adres roli** zamiast prywatnego Gmaila w `security.txt` i w DMARC `rua`.
+4. **Poczta:** DKIM (sprawdzić selektor w OVH), potem DMARC `p=reject`.
+5. Potwierdzić `Url.IsLocalUrl` dla `r=` (pkt 1.1) — jedyne, co zostało z Priorytetu 1.
+6. Drobiazgi: `X-Robots-Tag`, CAA, COOP/CORP, CSP `style-src`, kolejność 401 vs 400/415.
+7. Front-end: rzutowanie liczb w `nf()`/`num()` i escapowanie `p.id` w atrybucie.
+8. Test TLS na ssllabs.com i lokalna weryfikacja firewalla (`ufw status`, `ss -tulpn`).
+9. Priorytet 3 (higiena) i sekcja DDoS — nadal nietknięte.
